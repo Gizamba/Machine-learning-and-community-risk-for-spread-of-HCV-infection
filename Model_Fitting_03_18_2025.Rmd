@@ -29,7 +29,7 @@ library(mlr3resampling)
 Load data
 ```{r}
 #main dataset
-Aim_1_dat_2 <- read_csv("Aim_1_dat_2.csv")
+Aim_1_dat_2 <- read_csv("Aim_1_dat_2.csv") # Aim_1_dat_2 is similar to the Partial data provided in this repository. However, the HCV cases column was removed because that data has restricted access. 
 
 # select variables of interest
 Aim_1_dat_3 <- Aim_1_dat_2%>%
@@ -1018,3 +1018,4 @@ Aim_1_dat_Pred_shp <- LA_zip%>%left_join(Aim_1_dat_Pred_Cases_rename[,-42], by="
 # save as shapefile
 st_write(Aim_1_dat_Pred_shp, "Aim_1_dat_Pred.shp", append = F, delete_layer = T)
 ```
+
