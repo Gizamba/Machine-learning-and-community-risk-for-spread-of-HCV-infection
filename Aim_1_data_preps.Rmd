@@ -27,7 +27,7 @@ Age_com <- read_excel("data/ACS data 2022/ACS5Y2022POP.xlsx",
 Age_com$ZIP <- as.character(Age_com$ZIP)
 
 # Dataset for HCV cases and observed rates
-HCV_V <- read_excel("data/LAzip2020.xlsx")
+HCV_V <- read_excel("data/LAzip2020.xlsx") # This dataset has restricted access, therefore it's not included in this repository.
 #View(HCV_V)
 
 #dataset of specialist and non specialists
@@ -41,7 +41,7 @@ Lincesed_Pri_clinic <- read_csv("Lincesed_Pri_clinic.csv")
 Lincesed_Pri_clinic$ZIP <- as.character(Lincesed_Pri_clinic$ZIP)
 
 #dataset for distance to nearest pri care from zipcode centroid
-# distance were estimated using the Network analyst tool in ArcGIS Pro
+# distances were estimated using the Network Analyst tool in ArcGIS Pro
 dist_pri_care_LAZIP <- read_csv("dist_pri_care_LAZIP.csv")
 #View(dist_pri_care_LAZIP)
 dist_pri_care_LAZIP$ZIP <- as.character(dist_pri_care_LAZIP$ZIP)
@@ -218,4 +218,5 @@ Aim_1_dat_3_shp <- LA_zip%>%left_join(Aim_1_dat_3_name[,-14], by="ZIP")
 # save as shapefile
 st_write(Aim_1_dat_3_shp, "Aim_1_dat.shp", append = F, delete_layer = T)
 ```
+
 
