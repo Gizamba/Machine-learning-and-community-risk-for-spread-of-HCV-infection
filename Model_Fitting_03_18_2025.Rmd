@@ -1,0 +1,1020 @@
+---
+title: "Model _Fitting"
+author: "JMG"
+date: "2025-03-18"
+output: html_document
+---
+
+Libraries
+```{r, message=FALSE}
+library(readr)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(mlr3)
+library(mlr3learners)
+library(mlr3verse)
+library(dplyr)
+library(mlr3tuning)
+library(mlr3viz)
+library(mlr3filters)
+library(mlr3pipelines)
+library(data.table)
+library(ranger)
+library(ggplot2)
+library(mlr3resampling)
+
+```
+
+Load data
+```{r}
+#main dataset
+Aim_1_dat_2 <- read_csv("Aim_1_dat_2.csv")
+
+# select variables of interest
+Aim_1_dat_3 <- Aim_1_dat_2%>%
+  dplyr::select(3,14,15,40:44,53,55, 60:63,65,70:84,86:90,92:94)  
+
+#Rename a variable
+Aim_1_dat_3 <- Aim_1_dat_3 %>%
+  rename(Opioid_Hospitalization.100k = `Opioid_Hospitalization,100k`, 
+         Opioid_presciption.1k = `Opioid_presciption,1k`)
+
+# make some features numeric
+Aim_1_dat_3$medianHH.Income <- as.numeric(Aim_1_dat_3$medianHH.Income)
+```
+
+
+Prepare data for modeling
+```{r}
+# filter outlier zip codes, zip codes with >1000 cases
+Aim_1_dat_4 <- Aim_1_dat_3
+
+Aim_1_dat_4$Cases_RF <- as.integer(Aim_1_dat_4$Cases_RF) # Ensure Poisson target is integer
+
+# Use only complete cases
+Aim_1_dat_complete <- na.omit(Aim_1_dat_4) # only complete cases
+
+## add log of offset
+Aim_1_dat_complete <- Aim_1_dat_complete%>%
+  mutate(log_age18_39=log(age18_39))
+
+#Remove ID column from the anlysis
+Aim_1_dat_complete <- Aim_1_dat_complete[, -c(1,3,4,26,30,25)]
+
+
+## remove zip code with case_RF>300
+Aim_1_dat_complete <- Aim_1_dat_complete%>%
+  filter(Cases_RF<300)
+## There were 2 ZCTA with >300 cases. These ZCTA have prisons and most of their cases came from these settings. So they were excluded in the dataset used in the model.
+```
+
+Dataset (ZCTAs) not included in the Aim_1_dat_complete (data used in the model)
+```{r}
+Aim_1_Not_Incomplete <- Aim_1_dat_3%>%
+dplyr::select(-c(1,3,26,30,25))
+
+## add log of offset
+Aim_1_Not_Incomplete <- Aim_1_Not_Incomplete%>%
+mutate(log_age18_39=log(age18_39))%>%
+  dplyr::select(-2)
+
+# Remove rows where 'score' is Inf or -Inf
+Aim_1_Not_Incomplete <- Aim_1_Not_Incomplete %>%
+filter(!is.infinite(log_age18_39)) # remove zip codes with no data on most of variables 8 zip codes
+
+#install.packages("VIM")
+###imputation
+library(VIM)
+Aim_1_Not_Incomplete <- kNN(Aim_1_Not_Incomplete, variable = colnames(Aim_1_Not_Incomplete)[-5], k = 10)
+
+# Optional: remove the _imp indicator columns added by VIM
+Aim_1_Not_Incomplete<- Aim_1_Not_Incomplete %>% dplyr::select(-ends_with("_imp"))
+
+
+#onyl data for zip codes not included in Aim1datcomplete
+Aim_1_Not_Incomplete <- anti_join(Aim_1_Not_Incomplete,Aim_1_dat_complete) #zip codes not included in model training because of missingness
+
+```
+
+
+Models to fit:
+Traditional Poisson regression
+LASSO regression
+Elastic net regression
+Random forest
+LASSO + Random forest
+Elastic Net + Random forest model
+
+
+LASSO
+```{r}
+# Dataset
+X <- Aim_1_dat_complete[,-c(5,33)] #features
+y <- as.numeric(Aim_1_dat_complete$Cases_RF) #target variable
+offset_x = as.numeric(Aim_1_dat_complete$log_age18_39) #offset
+
+set.seed(123)
+#create folds 5-folds using caret
+K <- 5
+folds <- createFolds(y, k = K, list = TRUE, returnTrain = F)
+L_preds <- rep(NA, length(y))
+
+L_selected_features_list <-list()
+L_coef_list <- list() #store features per fold
+
+#-----loop through each fold
+for(i in seq_along(folds)){
+  test_idx <- folds[[i]] #indices for the test fold
+  train_idx <- setdiff(seq_along(y), test_idx) #remaining indices for training
+  
+  #split data into training and test set
+  X_train <- X[train_idx,]
+  y_train <- y[train_idx]
+  offset_train <-offset_x[train_idx]
+  
+  X_test <- X[test_idx,]
+  y_test <- y[test_idx]
+  offset_test <-offset_x[test_idx]
+  
+  #fit lasso
+  L_model <- cv.glmnet(
+    as.matrix(X_train), y_train,
+    family="poisson",
+    offset=offset_train,
+    alpha=1,
+    nfolds = 5
+  )
+  
+  #predict on test folds
+  L_preds[test_idx] <- predict(L_model, newx=as.matrix(X_test),
+                             s="lambda.min",
+                             type="response",
+                             newoffset=offset_test)
+  
+  #feature selecton in this fold
+  L_coefs <- coef(L_model, s="lambda.min")
+  nonzero_coefs <- which(L_coefs !=0)
+  L_selected <- rownames(L_coefs)[nonzero_coefs]
+  L_selected <- L_selected[L_selected != "(Intercept)"] #exclude intercept
+  
+  L_selected_features_list[[i]] <- L_selected #store selected feature names
+  if (length(L_selected) == 0) {
+warning("No features selected in fold ", i)
+next
+}
+  
+  #store coeficients as named vector
+  L_coef_vec <- as.vector(L_coefs)
+  names(L_coef_vec) <-rownames(L_coefs)
+  L_coef_vec <- L_coef_vec[L_selected]
+  L_coef_list[[i]] <- L_coef_vec
+  
+}
+
+
+#Model performance
+mae_LASSO <- mean(abs(y - L_preds)) # Calculate Mean absolute error
+rmse_LASSO <- mlr3measures::rmse(y,L_preds)
+
+# Calculate R-squared
+rsq_LASSO <- 1 - ((sum((y - L_preds)^2)) / (sum((y - mean(y))^2)))
+
+cor_L <- cor(y, L_preds) # correlation
+
+
+# Union of all features selected across folds
+lasso_final_features <- unique(unlist(L_selected_features_list))
+cat("Standalone CV LASSO selected", length(lasso_final_features), "features across folds.\n")
+
+
+#feature of importance
+L_Feat <- unlist(L_selected_features_list)
+L_feat_freq <- table(L_Feat)
+
+#combine all coef
+L_allcoef <- do.call(c, L_coef_list)
+L_coef_df <- data.frame(
+  Features=names(L_allcoef),
+  Coefficeints = L_allcoef
+)
+
+#compute average coef per feature
+L_avcoef_df <- L_coef_df%>%
+  group_by(Features)%>%
+  summarise(AvgCoef =mean(Coefficeints), .groups = "drop")
+
+#merge freq and avg coef
+L_feat_fq_df <- data.frame(
+  Features =names(L_feat_freq),
+  SelectionCount =as.integer(L_feat_freq))%>%
+  left_join(L_avcoef_df, by="Features")%>%
+  arrange(desc(SelectionCount)
+)
+
+
+# Keep only non-zero coefficients for plotting
+
+# Define color mapping: Positive = blue, Negative = red
+L_feat_fq_df$color <- ifelse(L_feat_fq_df$AvgCoef >= 0, "Risk factors", "Protective factors")
+
+
+# Create a lookup table for renaming
+feature_names <- c(
+log_age18_39 ="Log of Population 18-39 years",
+Poverty.level.p = "Proportion of households income below poverty level",
+ED_visit_allopioids.100k = "Opioid-related ED visits/100,000 residents",
+New.rate.18.22 ="New HIV cases/100,000",
+No.vehicle = "Proportion of Household without vehicle",
+P18_39  = "Proportion of residents aged 18-39 years",
+Uninsured.p = "Proportion of residents without insurance",
+p40_59 = "Proportion of residented aged 40-59 years",
+d_spe_miles = "Distance to HCV treatment specialists, miles",
+Asian.p = "Proportion of Asians",
+VacantUnits.p= "Proportion of vacant houshold units",
+Black.p = "Proportion of African-Americans",
+White.p ="Proportion of Whites",
+nearest_SUD_miles = "Distance to SUD treatment facility",
+Male.p = "Proportion of Male residents",
+AIAN.p = "Proportion of American Indian and Alaska Native"
+)
+# Rename features using dplyr::mutate()
+L_feat_fq_df <- L_feat_fq_df %>%
+mutate(feature_names = feature_names[Features])
+
+
+# Save as TIFF
+tiff("LASSOFeatures.tiff", width = 2200, height = 1500, res = 300)  #
+ggplot(L_feat_fq_df, aes(x = reorder(feature_names, AvgCoef), y = AvgCoef, fill=color)) +
+  geom_bar(stat = "identity", show.legend = F) +
+  coord_flip() +
+  labs(title = "LASSO Selected Features and Coefficients",
+       x = "Features of importance",
+       y = "Standardised Coefficient Estimate (log scale)",
+       fill="") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+ # scale_fill_manual(values = c("Risk factors" = "red", "Protective factors" = "green"))+
+  scale_y_continuous(
+   limits = c(-0.01,0.04 ),   # Set the y-axis limits (from 0 to 10)
+    breaks = seq(-0.01, 0.04, by = 0.02)) + # Set the manual y-axis breaks
+  geom_text(aes(label =round(AvgCoef,5) ), vjust = 0, hjust = 0, size=3)+
+  theme_classic()
+dev.off()
+
+```
+
+
+Elastic net
+```{r}
+# Dataset
+X <- Aim_1_dat_complete[,-c(5,33)] #features
+y <- as.numeric(Aim_1_dat_complete$Cases_RF) #target variable
+offset_x = as.numeric(Aim_1_dat_complete$log_age18_39) #offset
+
+set.seed(123)
+#create folds 5-folds using caret
+K <- 5
+folds <- createFolds(y, k = K, list = TRUE, returnTrain = F)
+E_preds <- rep(NA, length(y))
+
+E_selected_features_list <-list()
+E_coef_list <- list() #store features per fold
+
+#-----loop through each fold
+for(i in seq_along(folds)){
+  test_idx <- folds[[i]] #indices for the test fold
+  train_idx <- setdiff(seq_along(y), test_idx) #remaining indices for training
+  
+  #split data into training and test set
+  X_train <- X[train_idx,]
+  y_train <- y[train_idx]
+  offset_train <-offset_x[train_idx]
+  
+  X_test <- X[test_idx,]
+  y_test <- y[test_idx]
+  offset_test <-offset_x[test_idx]
+  
+  #fit lasso
+  E_model <- cv.glmnet(
+    as.matrix(X_train), y_train,
+    family="poisson",
+    offset=offset_train,
+    alpha=0.5,
+    nfolds = 5
+  )
+  
+  #predict on test folds
+  E_preds[test_idx] <- predict(E_model, newx=as.matrix(X_test),
+                             s="lambda.min",
+                             type="response",
+                             newoffset=offset_test)
+  
+  #feature selecton in this fold
+  E_coefs <- coef(E_model, s="lambda.min")
+  nonzero_coefs <- which(E_coefs !=0)
+  E_selected <- rownames(E_coefs)[nonzero_coefs]
+  E_selected <- E_selected[E_selected != "(Intercept)"] #exclude intercept
+  
+  E_selected_features_list[[i]] <- E_selected #store selected feature names
+  
+  #store coeficients as named vector
+  E_coef_vec <- as.vector(E_coefs)
+  names(E_coef_vec) <-rownames(E_coefs)
+  E_coef_vec <- E_coef_vec[E_selected]
+  E_coef_list[[i]] <- E_coef_vec
+  
+}
+
+
+# Union of all features selected across folds
+Elastic_final_features <- unique(unlist(E_selected_features_list))
+cat("Standalone CV Elastic selected", length(Elastic_final_features), "features across folds.\n")
+
+
+#Model perfomance: out of sample performance
+
+mae_E <- mean(abs(y - E_preds)) # Calculate Mean absolute error
+rmse_E <- mlr3measures::rmse(y,E_preds)
+
+# Calculate R-squared
+rsq_E <- 1 - ((sum((y - E_preds)^2)) / (sum((y - mean(y))^2)))
+
+cor_E <- cor(y, E_preds) # correlation
+
+
+#feature of importance
+E_Feat <- unlist(E_selected_features_list)
+E_feat_freq <- table(E_Feat)
+
+#combine all coef
+E_allcoef <- do.call(c, E_coef_list)
+E_coef_df <- data.frame(
+  Features=names(E_allcoef),
+  Coefficeints = E_allcoef
+)
+
+#compute average coef per feature
+E_avcoef_df <- E_coef_df%>%
+  group_by(Features)%>%
+  summarise(AvgCoef =mean(Coefficeints), .groups = "drop")
+
+#merge freq and avg coef
+E_feat_fq_df <- data.frame(
+  Features =names(E_feat_freq),
+  SelectionCount =as.integer(E_feat_freq))%>%
+  left_join(E_avcoef_df, by="Features")%>%
+  arrange(desc(SelectionCount)
+)
+
+# Keep only non-zero coefficients for plotting
+# Define color mapping: Positive = blue, Negative = red
+E_feat_fq_df$color <- ifelse(E_feat_fq_df$AvgCoef >= 0, "Risk factors", "Protective factors")
+
+# Create a lookup table for renaming
+feature_names <- c(
+log_age18_39 ="Log of Population 18-39 years",
+Poverty.level.p = "Proportion of households income below poverty level",
+ED_visit_allopioids.100k = "Opioid-related ED visits/100,000 residents",
+New.rate.18.22 ="New HIV cases/100,000",
+No.vehicle = "Proportion of Household without vehicle",
+P18_39  = "Proportion of residents aged 18-39 years",
+Uninsured.p = "Proportion of residents without insurance",
+p40_59 = "Proportion of residented aged 40-59 years",
+d_spe_miles = "Distance to HCV treatment specialists, miles",
+Asian.p = "Proportion of Asians",
+VacantUnits.p= "Proportion of vacant houshold units",
+Black.p = "Proportion of African-Americans",
+White.p ="Proportion of Whites",
+nearest_SUD_miles = "Distance to SUD treatment facility",
+Male.p = "Proportion of Male residents",
+AIAN.p = "Proportion of American Indian and Alaska Native",
+Opioid_Hospitalization.100k ="Opioid hospitalizations /100000"
+)
+# Rename features using dplyr::mutate()
+E_feat_fq_df <- E_feat_fq_df %>%
+mutate(feature_names = feature_names[Features])
+
+# Save as TIFF
+tiff("ELASTICFeatures.tiff", width = 2200, height = 1500, res = 300)  #
+ggplot(E_feat_fq_df, aes(x = reorder(feature_names, AvgCoef), y = AvgCoef, fill=color)) +
+  geom_bar(stat = "identity", show.legend = F) +
+  coord_flip() +
+  labs(title = "Elastic Net Selected Features and Coefficients",
+       x = "Features of importance",
+       y = "Standardised Coefficient Estimate (log scale)",
+       fill="") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+ # scale_fill_manual(values = c("Risk factors" = "red", "Protective factors" = "green"))+
+  scale_y_continuous(
+   limits = c(-0.01,0.03 ),   # Set the y-axis limits (from 0 to 10)
+    breaks = seq(-0.01, 0.03, by = 0.01)) + # Set the manual y-axis breaks
+  geom_text(aes(label =round(AvgCoef,4) ), vjust = 0, hjust = 0, size=3)+
+  theme_classic()
+dev.off()
+```
+
+
+Traditional Poisson regression
+```{r}
+library(MASS)
+# Dataset
+X <- Aim_1_dat_complete[,-5] #features
+#X <- scale(X) #scale features
+#X <- as.data.frame(X)
+y <- as.numeric(Aim_1_dat_complete$Cases_RF) #target variable
+offset_x = as.numeric(Aim_1_dat_complete$log_age18_39) #offset
+
+set.seed(123)
+#create folds 5-folds using caret
+K <- 5
+folds <- createFolds(y, k = K, list = TRUE, returnTrain = F)
+P_preds <- rep(NA, length(y))
+
+
+#E_selected_features_list <-list()
+P_coef_list <- list() #store features per fold
+P_selected_features_list <- list()
+
+#-----loop through each fold
+for(i in seq_along(folds)){
+  test_idx <- folds[[i]] #indices for the test fold
+  train_idx <- setdiff(seq_along(y), test_idx) #remaining indices for training
+  
+  #split data into training and test set
+ # Training and test sets
+  train_data <- X[train_idx, ]
+  test_data  <- X[test_idx, ]
+  y_train <- y[train_idx]
+  y_test  <- y[test_idx]
+  
+   #offset_train <-offset_x[train_idx]
+
+  # Combine target and predictors
+  train_data$y <- y_train
+  test_data$y <- y_test
+  
+  
+  #fit poisson
+formula_str =paste("y~", paste(colnames(X)[-33], collapse = "+"))
+ 
+P_model <- glm(as.formula(formula_str), data = train_data, offset = train_data$log_age18_39,
+               family = poisson())
+                   
+  
+  #predict on test folds
+  P_preds[test_idx] <- predict(P_model, newdata = test_data,
+                             type = "response",
+                             offset = test_data$offset)
+  
+  #feature selecton in this fold
+ P_coefs <- coef(P_model)
+ 
+  # Extract non-zero coefficient_
+  nonzero_coefs <- P_coefs[abs(P_coefs) > 1e-6]
+  selected_P <- names(nonzero_coefs)
+  selected_P <- selected_P[selected_P != "(Intercept)"]
+  
+  #P_coef_list[[i]] <- P_coefs 
+  P_selected_features_list[[i]] <- selected_P
+  P_coef_list[[i]] <- nonzero_coefs[selected_P] #store selected feature names
+}
+
+
+#Model perfomance
+##P_preds[is.infinite(P_preds)] <-2
+mae_P <- mean(abs(y - P_preds)) # Calculate Mean absolute error
+rmse_P <- mlr3measures::rmse(y,P_preds)
+
+
+# Calculate R-squared
+rsq_P <- 1 - ((sum((y - P_preds)^2)) / (sum((y - mean(y))^2)))
+
+cor_P <- cor(y, P_preds) # correlation
+
+
+# --- Feature Selection Summary ---
+P_all_selected <- unlist(P_selected_features_list)
+feature_freq <- table(P_all_selected)
+
+P_allcoef <- do.call(c, P_coef_list)
+P_coef_summary <- data.frame(
+  Feature = names(P_allcoef),
+  Coefficient = P_allcoef
+)
+
+P_avg_coef_df <- P_coef_summary %>%
+  group_by(Feature) %>%
+  summarise(AvgCoefficient = mean(Coefficient), .groups = "drop")
+
+P_feature_freq_df <- data.frame(
+  Feature = names(feature_freq),
+  SelectionCount = as.integer(feature_freq)
+) %>%
+  left_join(P_avg_coef_df, by = "Feature") %>%
+  arrange(desc(SelectionCount))
+
+print(P_feature_freq_df)
+
+# Keep only non-zero coefficients for plotting
+
+# Define color mapping: Positive = blue, Negative = red
+P_feature_freq_df$color <- ifelse(P_feature_freq_df$AvgCoefficient >= 0, "Risk factors", "Protective factors")
+
+
+
+# Save as TIFF
+tiff("PoissonFeatures.tiff", width = 2200, height = 1500, res = 300)  #
+ggplot(P_feature_freq_df, aes(x = reorder(Feature, AvgCoefficient), y = AvgCoefficient, fill=color)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Poisson regression Coefficients",
+       x = "Features of importance",
+       y = "Coefficient Estimate (log scale)",
+       fill="") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("Risk factors" = "red", "Protective factors" = "green"))+
+  scale_y_continuous(
+   limits = c(-0.3,0.3 ),   # Set the y-axis limits (from 0 to 10)
+    breaks = seq(-0.3, 0.3, by = 0.25)) + # Set the manual y-axis breaks
+  geom_text(aes(label =round(AvgCoefficient,4) ), vjust = 0, hjust = 0, size=2)+
+  theme_classic()
+dev.off()
+```
+
+
+Random forest
+```{r}
+# Dataset
+X <- Aim_1_dat_complete[,-5] #features
+y <- as.numeric(Aim_1_dat_complete$Cases_RF) #target variable
+offset_x = as.numeric(Aim_1_dat_complete$log_age18_39) #offset
+
+set.seed(123)
+#create folds 5-folds using caret
+K <- 5
+folds <- createFolds(y, k = K, list = TRUE, returnTrain = F)
+Rf_preds <- rep(NA, length(y))
+
+Rf_importance_list <-list()
+
+
+#-----loop through each fold
+for(i in seq_along(folds)){
+  test_idx <- folds[[i]] #indices for the test fold
+  train_idx <- setdiff(seq_along(y), test_idx) #remaining indices for training
+  
+  #split data into training and test set
+  X_train <- X[train_idx,]
+  y_train <- y[train_idx]
+ 
+  X_test <- X[test_idx,]
+  y_test <- y[test_idx]
+ 
+  
+  #fit RF
+  Rf_model <- randomForest(x = X_train, y = y_train, ntree=500, importance = T)
+  
+  #predict on test folds
+  Rf_preds[test_idx] <- predict(Rf_model, newdata =X_test)
+  
+  #store importance
+ imp <- randomForest::importance(Rf_model, type=1)
+ Rf_importance_list[[i]] <-imp
+}
+  
+
+# --- Aggregate feature importance ---
+Rf_importance_df <- do.call(cbind, Rf_importance_list)
+importance_means <- rowMeans(Rf_importance_df)
+
+Rf_feature_importance <- data.frame(
+  Feature = rownames(Rf_importance_df),
+  MeanImportance = importance_means
+) %>%
+  arrange(desc(MeanImportance))
+
+cat("\nAverage Feature Importance Across Folds:\n")
+print(Rf_feature_importance)
+
+
+
+tiff("FeatureImportance_RF.tiff", width = 2200, height = 1500, res = 300)
+ggplot(Rf_feature_importance[-1,], aes(x = reorder(Feature, MeanImportance), y = MeanImportance)) +
+geom_col(fill = "lightblue",
+width = 0.7, show.legend = FALSE) +
+coord_flip() +
+labs(title = "Random Forest Features of Importance",
+x = "Features",
+y = "Importance score") +
+theme_classic()
+dev.off()
+
+
+
+
+
+#Model perfomance
+
+mae_rf <- mean(abs(y - Rf_preds)) # Calculate Mean absolute error
+rmse_rf <- mlr3measures::rmse(y,Rf_preds)
+
+# Calculate R-squared
+rsq_rf <- 1 - ((sum((y - Rf_preds)^2)) / (sum((y - mean(y))^2)))
+
+cor_rf <- cor(y, Rf_preds) # correlation
+
+```
+
+
+Hybrid Elastic Net and random forest
+```{r}
+### Elastic Net and Random forest. the feature selected in the Elastic net CV model are used. this results into same selected variables. hence better comparison
+
+# Dataset
+X <- Aim_1_dat_complete[,-5] #features
+y <- as.numeric(Aim_1_dat_complete$Cases_RF) #target variable
+offset_x = as.numeric(Aim_1_dat_complete$log_age18_39) #offset
+
+#Hybrid Model (RF on Elastic net-selected features) ---
+
+# Outer cross-validation setup
+set.seed(123)
+K <- 5
+folds <- createFolds(y, k = K, list = TRUE)
+all_preds_3 <- rep(NA, length(y))
+# Track feature importance and selection
+importance_list_3 <- list()
+#selection_counts <- list()
+
+# Outer loop
+for (i in seq_along(folds)) {
+test_idx <- folds[[i]]
+train_idx <- setdiff(seq_along(y), test_idx)
+
+##Use lasso selected features
+ X_train <- X[train_idx, Elastic_final_features, drop = FALSE]
+  y_train <- y[train_idx]
+   X_test <- X[test_idx, Elastic_final_features, drop = FALSE]
+
+ 
+#Random Forest on selected features
+ rf_3 <- randomForest(x = X_train, y = y_train, importance = T)
+ preds_3 <- predict(rf_3, newdata = X_test)
+
+ 
+all_preds_3[test_idx] <- preds_3
+
+# Store feature importance
+imp <- randomForest::importance(rf_3, type = 1) # Mean Decrease in Accuracy
+imp_df <- data.frame(
+Feature = rownames(imp),
+Importance = imp[, 1],
+Fold = i
+)
+importance_list_3[[i]] <- imp_df
+}
+
+# Performance evaluation
+mse_3 <- mean((y - all_preds_3)^2, na.rm = TRUE)
+mae_E_RF_2 <- mean(abs(y - all_preds_3)) # Calculate Mean absolute error
+rmse_E_RF_2 <- mlr3measures::rmse(y,all_preds_3)
+
+# Calculate R-squared
+rsq_E_RF_2 <- 1 - ((sum((y - all_preds_3)^2)) / (sum((y - mean(y))^2)))
+
+cor_E_RF_2 <- cor(y, all_preds_3) # correlation
+
+# Combine importance across folds
+all_importance <- as.data.frame(do.call(rbind, importance_list_3))
+
+# --- Feature Importance from Hybrid Model ---
+importance_summary_E2 <- all_importance %>%
+dplyr::group_by(Feature) %>%
+dplyr::summarize(MeanImportance = mean(Importance),.groups = "drop") %>%
+arrange(desc(MeanImportance))
+
+# --- Merge Coefficients from LASSO and RF Importance ---
+E_final_feature_df <- left_join(E_avcoef_df, importance_summary_E2, by = join_by("Features" == "Feature")) %>%
+  arrange(desc(MeanImportance))
+
+cat("\nFinal Selected Features from Elastic + Their RF Importance:\n")
+print(E_final_feature_df)
+
+# Create a lookup table for renaming
+feature_names <- c(
+log_age18_39 ="Log of Population 18-39 years",
+Poverty.level.p = "Proportion of families with income below poverty level",
+ED_visit_allopioids.100k = "Opioid-related Emergency Department visits/100,000",
+New.rate.18.22 ="New reported HIV diagnoses/100000",
+No.vehicle = "Proportion of Household without vehicle",
+P18_39  = "Proportion of residents aged 18-39 years",
+Uninsured.p = "Proportion of residents without insurance",
+p40_59 = "Proportion of residented aged 40-59 years",
+d_spe_miles = "Distance to HCV treatment specialists, miles",
+Asian.p = "Proportion of Asians",
+VacantUnits.p= "Proportion of vacant houshold units",
+Black.p = "Proportion of African-Americans",
+White.p ="Proportion of Whites",
+nearest_SUD_miles = "Distance to nearest Substance Use Disorder treatment facility",
+Male.p = "Proportion of Male residents",
+AIAN.p = "Proportion of American Indian and Alaska Native",
+Opioid_Hospitalization.100k ="Opioid-related hospitalizations /100000"
+)
+# Rename features using dplyr::mutate()
+E_final_feature_df <- E_final_feature_df %>%
+mutate(feature_names = feature_names[Features])
+
+#Save E and random forest features of importance
+tiff("E_RF_Features.tiff", width = 2300, height = 1500, res = 300)  #
+E_final_feature_df%>%
+  ggplot(., aes(x = reorder(feature_names, MeanImportance), y = MeanImportance)) +
+  geom_col(fill = "lightblue",
+width = 0.7, show.legend = FALSE) +
+  #geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(#title = "Random Forest with Elastic Net selected features",
+x = "Important Variables",
+y = "Importance score") +
+ # geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+ # scale_fill_manual(values = c("Risk factors" = "red", "Protective factors" = "green"))+
+  scale_y_continuous(
+   limits = c(0,16),   # Set the y-axis limits (from 0 to 10)
+   breaks = seq(0, 15, by = 5), expand = c(0,0)) + # Set the manual y-axis breaks
+  geom_text(aes(label =format(round(AvgCoef,4), scientific=F), color="Coefficients"), vjust = 0, hjust = 0, size=2.5, show.legend = T, color="blue")+
+  scale_color_manual(name="",values=c("Coefficients"="red"))+
+  theme(axis.title.x=element_text(face = "bold"),
+              axis.title.y=element_text(face = "bold"),
+              axis.text.x=element_text(face = "bold",size=12),
+              axis.text.y=element_text(face="bold",size=12),
+        legend.position.inside = c(0.95,0.05),
+        axis.line = element_line(color="black"))+
+  theme_minimal()
+dev.off()
+```
+
+
+Hybrid LASSO and Random forest models
+```{r}
+### another version of LASSO and Random forest. the feature selected in the LASSO CV model are used in Random forest model. this results into same selected variables. hence better comparison of the models
+
+# Dataset
+X <- Aim_1_dat_complete[,-5] #features
+y <- as.numeric(Aim_1_dat_complete$Cases_RF) #target variable
+offset_x = as.numeric(Aim_1_dat_complete$log_age18_39) #offset
+
+#. Hybrid Model (RF on LASSO-selected features) ---
+
+# Outer cross-validation setup
+set.seed(123)
+K <- 5
+folds <- createFolds(y, k = K, list = TRUE)
+all_preds_2 <- rep(NA, length(y))
+# Track feature importance and selection
+importance_list_2 <- list()
+#selection_counts <- list()
+
+# Outer loop
+for (i in seq_along(folds)) {
+test_idx <- folds[[i]]
+train_idx <- setdiff(seq_along(y), test_idx)
+
+##Use lasso selected features
+ X_train <- X[train_idx, lasso_final_features, drop = FALSE]
+  y_train <- y[train_idx]
+   X_test <- X[test_idx, lasso_final_features, drop = FALSE]
+
+ 
+# Step 2: Random Forest on selected features
+ rf_2 <- randomForest(x = X_train, y = y_train, importance = T)
+ preds_2 <- predict(rf_2, newdata = X_test)
+
+ 
+all_preds_2[test_idx] <- preds_2
+
+# Store feature importance
+imp <- randomForest::importance(rf_2, type = 1) # Mean Decrease in Accuracy
+imp_df <- data.frame(
+Feature = rownames(imp),
+Importance = imp[, 1],
+Fold = i
+)
+importance_list_2[[i]] <- imp_df
+}
+
+# Performance evaluation
+mse_2 <- mean((y - all_preds_2)^2, na.rm = TRUE)
+mae_LASSO_RF_2 <- mean(abs(y - all_preds_2)) # Calculate Mean absolute error
+rmse_LASSO_RF_2 <- mlr3measures::rmse(y,all_preds_2)
+
+# Calculate R-squared
+rsq_LASSO_RF_2 <- 1 - ((sum((y - all_preds_2)^2)) / (sum((y - mean(y))^2)))
+
+cor_LASSO_RF_2 <- cor(y, all_preds_2) # correlation
+
+# Combine importance across folds
+all_importance <- as.data.frame(do.call(rbind, importance_list_2))
+
+# --- Feature Importance from Hybrid Model ---
+importance_summary_L2 <- all_importance %>%
+dplyr::group_by(Feature) %>%
+dplyr::summarize(MeanImportance = mean(Importance),.groups = "drop") %>%
+arrange(desc(MeanImportance))
+
+# --- Merge Coefficients from LASSO and RF Importance ---
+final_feature_df <- left_join(L_avcoef_df, importance_summary_L2, by = join_by("Features" == "Feature")) %>%
+  arrange(desc(MeanImportance))
+
+cat("\nFinal Selected Features from LASSO + Their RF Importance:\n")
+print(final_feature_df)
+
+# Create a lookup table for renaming
+feature_names <- c(
+log_age18_39 ="Log of Population 18-39 years",
+Poverty.level.p = "Proportion of households income below poverty level",
+ED_visit_allopioids.100k = "Opioid-related ED visits/100,000 residents",
+New.rate.18.22 ="New HIV cases/100,000",
+No.vehicle = "Proportion of Household without vehicle",
+P18_39  = "Proportion of residents aged 18-39 years",
+Uninsured.p = "Proportion of residents without insurance",
+p40_59 = "Proportion of residented aged 40-59 years",
+d_spe_miles = "Distance to HCV treatment specialists, miles",
+Asian.p = "Proportion of Asians",
+VacantUnits.p= "Proportion of vacant houshold units",
+Black.p = "Proportion of African-Americans",
+White.p ="Proportion of Whites",
+nearest_SUD_miles = "Distance to SUD treatment facility",
+Male.p = "Proportion of Male residents",
+AIAN.p = "Proportion of American Indian and Alaska Native",
+Opioid_Hospitalization.100k ="Opioid hospitalizations /100000"
+)
+# Rename features using dplyr::mutate()
+final_feature_df <- final_feature_df %>%
+mutate(feature_names = feature_names[Features])
+
+#Save lasso and random forest features of importance
+tiff("LASSO_RF_Features.tiff", width = 2200, height = 1500, res = 300)  #
+final_feature_df%>%
+  ggplot(., aes(x = reorder(feature_names, MeanImportance), y = MeanImportance)) +
+  geom_col(fill = "lightblue",
+width = 0.7, show.legend = FALSE) +
+  #geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Random Forest with LASSO selected features",
+x = "Features",
+y = "Importance score") +
+ # geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+ # scale_fill_manual(values = c("Risk factors" = "red", "Protective factors" = "green"))+
+  scale_y_continuous(
+   limits = c(0,15),   # Set the y-axis limits (from 0 to 10)
+   breaks = seq(0, 15, by = 5)) + # Set the manual y-axis breaks
+  geom_text(aes(label =round(AvgCoef,4) ), vjust = 0, hjust = 0, size=3)+
+  theme_classic()
+dev.off()
+```
+
+
+Visualise Model performance of all 5 models
+```{r}
+res_df = data.frame(
+model = c("Poisson","LASSO","ELASTIC Net", "Random Forest", "LASSO+Random Forest", "ELASTIC+Random Forest"),
+rmse = c(rmse_P, rmse_LASSO, rmse_E, rmse_rf, rmse_LASSO_RF_2, rmse_E_RF_2),
+mae = c(mae_P, mae_LASSO, mae_E, mae_rf, mae_LASSO_RF_2, mae_E_RF_2),
+rsq = c(rsq_P, rsq_LASSO, rsq_E,rsq_rf, rsq_LASSO_RF_2, rsq_E_RF_2),
+cor = c(cor_P, cor_L, cor_E,cor_rf, cor_LASSO_RF_2, cor_E_RF_2)
+)
+#plot metric comparisons
+library(tidyr)
+res_df_long = pivot_longer(res_df, cols = c("rmse", "mae", "rsq","cor"), names_to = "metric", values_to = "value")
+res_df_long$model <- factor(res_df_long$model, levels =c("Poisson","LASSO","ELASTIC Net", "Random Forest", "LASSO+Random Forest", "ELASTIC+Random Forest"))
+# Save as TIFF
+tiff("CompareModelsfull_rmse.tiff", width = 1900, height = 2000, res = 300)
+res_df_long%>%
+filter(metric!="rsq")%>%
+  filter(model !="Poisson")%>%
+  filter(metric!="cor")%>%
+  filter(metric!="mae")%>%
+ggplot(., aes(x = factor(model), y = value, fill = model)) +
+geom_col(position = "dodge", width = 0.9, fill="lightblue") +
+#coord_flip()+
+#facet_wrap(~ metric, scales = "free") +
+labs(#title = "Model Performance Comparison", 
+  y="Performance estimates: RMSE",x="Models" ) +
+  theme(axis.title.x=element_text(face = "bold"),
+              axis.title.y=element_text(face = "bold"),
+              axis.text.x=element_text(face = "bold"),
+              axis.text.y=element_text(face = "bold"))+
+theme_classic() +
+ # scale_y_continuous(
+   #limits = c(0,20 ),   # Set the y-axis limits (from 0 to 10)
+   # breaks = seq(0, 20, by = 5)) + # Set the manual y-axis breaks
+#theme(legend.position = "none")+
+theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))+
+geom_text(aes(label =round(value,2) ), vjust = 1.5, hjust = 0.5, size=4)
+  #scale_x_discrete(expand = c(0.02,0.02))
+dev.off()
+```
+
+
+
+Prediction on Aim_1_complete_data using the hybrid Elastic Net + Random forest model
+```{r}
+X <- Aim_1_dat_complete[,-5] #features
+y <- as.numeric(Aim_1_dat_complete$Cases_RF) #target variable
+
+X_2 <- Aim_1_Not_Incomplete[,-5]
+##Use the hybrid elastic net and random forest model to predict on the full dataset.Run this 50 times, and average the predictions across runs.
+
+# Set number of runs
+n_runs <- 50
+# Store predictions
+all_preds <- matrix(NA, #nrow =nrow(X), 
+                     #nrow(Aim_1_Not_Incomplete), #dataset not used in model development
+                    nrow(Aim_1_dat_complete), #data set used in model development
+                    ncol = n_runs)
+set.seed(123)  # for reproducibility
+
+for (i in 1:n_runs) {
+ model=rf_3 # hybrid Elastic net + RF model
+ 
+ #prediction
+all_preds[, i] <- predict(model, newdata=X_2[, Elastic_final_features])
+}
+
+
+# Compute average prediction
+avg_prediction_Erf <- rowMeans(all_preds) #prediction on complete data used in model building
+avg_prediction_2_Erf <- rowMeans(all_preds) # prediction on data of zip codes not included in model building
+
+
+## add predicted values to Aim 1data complete
+Aim_1_dat_complete <- Aim_1_dat_complete%>%
+mutate(Pred_Cases_Erf=avg_prediction_Erf)
+
+
+## add avg prediction 2 to aim 1 not incomplete
+Aim_1_Not_Incomplete <- Aim_1_Not_Incomplete%>%
+mutate(Pred_Cases_Erf=avg_prediction_2_Erf)
+
+
+### ROW bind Aim 1data complete with aim not complete
+Aim_1_dat_complete_v2 <- rbind(Aim_1_dat_complete, Aim_1_Not_Incomplete)
+
+# sort in ascending order
+Aim_1_dat_complete_v2 <- Aim_1_dat_complete_v2[order(Aim_1_dat_complete_v2$log_age18_39), ]
+
+Aim_1_dat_Pred_Cases <-Aim_1_dat_3%>%
+mutate(log_age18_39_1 =log(age18_39)) #add log of age18-39
+
+# Remove rows where 'score' is Inf or -Inf
+Aim_1_dat_Pred_Cases<- Aim_1_dat_Pred_Cases %>%
+filter(!is.infinite(log_age18_39_1)) # 8 zip codes removed
+
+# sort in ascending order
+Aim_1_dat_Pred_Cases <- Aim_1_dat_Pred_Cases[order(Aim_1_dat_Pred_Cases$log_age18_39_1), ]
+
+Aim_1_dat_Pred_Cases$age18_39_2 <- Aim_1_dat_Pred_Cases$age18_39
+Aim_1_dat_Pred_Cases$age18_39_2[Aim_1_dat_Pred_Cases$age18_39_2<500]<-NA
+
+## add predicted cases from Aim 1 data complete_V2 to Aim 1 dat pred cases
+Aim_1_dat_Pred_Cases<-Aim_1_dat_Pred_Cases%>%
+dplyr::mutate(Pred_Cases_Erf=Aim_1_dat_complete_v2$Pred_Cases_Erf,
+log_age18_39=Aim_1_dat_complete_v2$log_age18_39,
+HCV_Orate=round((Cases_RF/age18_39)*100000,3),
+HCV_Prate_Erf=round((Pred_Cases_Erf/age18_39)*100000,3)
+)
+
+##create percentiles
+# Create a new column with pentile categories
+Aim_1_dat_Pred_Cases <-  Aim_1_dat_Pred_Cases %>%
+mutate(
+HCV_Ppentile = ntile(HCV_Prate_Erf, 5),
+HCV_Ppentile = factor(HCV_Ppentile,
+labels = c("Lowest 20%", "Low-Mid", "Middle", "High-Mid", "Top 20%"))
+)
+
+#save as excel
+writexl::write_xlsx(Aim_1_dat_Pred_Cases, "Pred_HCV_Rate_v2.xlsx")
+```
+
+
+Shapefile for predicted data. Used later for mapping in ArcGIS pro 
+```{r}
+library(sf)
+library(dplyr)
+LA_zip <- st_read("D:/LA county analysis/zipcodedata/Zip_Codes_(LA_County).shp") # ZCTAs
+
+LA_zip <- LA_zip%>%
+dplyr::select(-c(1,2,4,6))
+LA_zip$ZIP <- as.character(LA_zip$ZIP)
+
+# Rename long field names to 10 characters or less
+Aim_1_dat_Pred_Cases_rename <- Aim_1_dat_Pred_Cases
+Aim_1_dat_Pred_Cases_rename$ZIP <- as.character(Aim_1_dat_Pred_Cases_rename$ZIP)
+colnames(Aim_1_dat_Pred_Cases_rename) <- substr(colnames(Aim_1_dat_Pred_Cases_rename), 1, 10)  # Truncate to 10 character
+
+#Aim_1_dat_3 shapefile
+Aim_1_dat_Pred_shp <- LA_zip%>%left_join(Aim_1_dat_Pred_Cases_rename[,-42], by="ZIP")
+
+# save as shapefile
+st_write(Aim_1_dat_Pred_shp, "Aim_1_dat_Pred.shp", append = F, delete_layer = T)
+```
