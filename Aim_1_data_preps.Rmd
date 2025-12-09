@@ -1,0 +1,221 @@
+---
+title: "Data_preparation"
+author: "JMG"
+date: "2025-03-17"
+output: html_document
+---
+
+libraries
+```{r, message=FALSE}
+library(readxl)
+library(readr)
+library(dplyr)
+```
+
+import Data
+```{r}
+# data set with independent variables
+Independent_V <- read_excel("data/ACS data 2022/ACS5Y2022POP.xlsx", 
+    sheet = "Aim_1_data")
+#View(Independent_V)
+Independent_V$ZIP <- as.character(Independent_V$ZIP)
+
+# data set with other independent variables
+Age_com <- read_excel("data/ACS data 2022/ACS5Y2022POP.xlsx", 
+    sheet = "Sheet2")
+#View(Age_com)
+Age_com$ZIP <- as.character(Age_com$ZIP)
+
+# Dataset for HCV cases and observed rates
+HCV_V <- read_excel("data/LAzip2020.xlsx")
+#View(HCV_V)
+
+#dataset of specialist and non specialists
+Providers_V <- read_csv("data/specialist_NSpecialist_LAZIP.csv")
+#View(Providers_V)
+Providers_V$ZIP <- as.character(Providers_V$ZIP)
+
+#dataset for primary care clinics per zip code
+Lincesed_Pri_clinic <- read_csv("Lincesed_Pri_clinic.csv")
+#View(Lincesed_Pri_clinic)
+Lincesed_Pri_clinic$ZIP <- as.character(Lincesed_Pri_clinic$ZIP)
+
+#dataset for distance to nearest pri care from zipcode centroid
+# distance were estimated using the Network analyst tool in ArcGIS Pro
+dist_pri_care_LAZIP <- read_csv("dist_pri_care_LAZIP.csv")
+#View(dist_pri_care_LAZIP)
+dist_pri_care_LAZIP$ZIP <- as.character(dist_pri_care_LAZIP$ZIP)
+
+#dataset of SUD centers in LA per zip code
+SUD_centers_LA <- read_csv("SUD_centers_LA.csv")
+#View(SUD_centers_LA)
+SUD_centers_LA$ZIP <- as.character(SUD_centers_LA$ZIP)
+
+#data for zip code area
+LA_ZCTA_Area <- read_csv("LA_ZCTA_Area.csv")
+#View(LA_ZCTA_Area)
+LA_ZCTA_Area$GEOID20 <- as.character(LA_ZCTA_Area$GEOID20)
+
+#dataset for distance to nearest specialist, PCP and Nurse or physician assistant
+zip_providers_dist <- read_csv("data/zip_providers_dist.csv")
+#View(zip_providers_dist)
+zip_providers_dist$ZIP <- as.character(zip_providers_dist$ZIP)
+
+#dataset with prevalence (2022) and incidence of HIV (2018-2022)
+HIVdat <- read_excel("D:/LA county analysis/LosAngeles_AIDSVu_DownloadableDataset_2021.xlsx", 
+    sheet = "HIV")
+#View(HIVdat)
+HIVdat$GEOID <- as.character(HIVdat$GEOID)
+
+
+```
+
+The dataset
+```{r}
+Aim_1_dat <- full_join(Independent_V, HCV_V[,c(2,6:9)], by="ZIP") #add HCV add and independent variables
+
+Aim_1_dat <- full_join(Aim_1_dat, Providers_V, by="ZIP") # add providers data
+
+Aim_1_dat <- full_join(Aim_1_dat, Lincesed_Pri_clinic[,c(2,3)], by="ZIP") # add pri care facilities data
+
+Aim_1_dat <- full_join(Aim_1_dat, dist_pri_care_LAZIP[,c(2:6)], by="ZIP") # add distance to pri care and SUD facilities data
+
+Aim_1_dat <- full_join(Aim_1_dat, SUD_centers_LA[,c(2,3)], by="ZIP") # add SUD care data
+
+
+Aim_1_dat <- left_join(Aim_1_dat,LA_ZCTA_Area[,c(2,3)], join_by("ZIP"=="GEOID20")) #add dataset for zip code area size
+
+Aim_1_dat <- left_join(Aim_1_dat,Age_com[,c(2,3,4)], by="ZIP") #add dataset for age composition
+
+Aim_1_dat <- left_join(Aim_1_dat,zip_providers_dist[,c(1,5:7)], by="ZIP") #add dataset for distance to nearest provider (specialist, PCP and nurse)
+
+Aim_1_dat <- left_join(Aim_1_dat,HIVdat[,c(1,7:10)], join_by("ZIP"=="GEOID")) #add dataset HIV
+
+#remove rows with no data at all
+Aim_1_dat <- Aim_1_dat[!is.na(Aim_1_dat$NAME), ]
+
+
+#Aim_1_dat <- left_join(Aim_1_dat,dist_pri_care_LAZIP[,c(2,5,6)], by="ZIP") #add dataset distance to SUD
+
+```
+
+
+Data wrangling
+Mutating some variables to get proportions
+```{r}
+# number of PCP (internal and family medicine) per 1000 population
+Aim_1_dat_2 <- Aim_1_dat%>%
+  mutate(PCP_1000=(Int_family/Tot2022)*1000,# # of PCP (internal and family medicine)/1000 pop
+         specialist_1000=(Specialists/Tot2022)*1000, # #of specialists/1000 pop
+         Non_PCP_1000 =(Nurs_Assist/Tot2022)*1000, # #of nurses and physician assistants per 1000pop
+         below18.p=(Totless18/Tot2022)*100, #% of residents aged <18yrs
+         NoDiploma.p=(`12th grade, no diploma`/PopOver25Y)*100, # % of residents over 25yrs with no high school diploma
+         Diploma.p=(`Regular high school diploma`/PopOver25Y)*100, # % of residents over 25yrs with regular high school diploma
+          Bachelar.p =(`Tot.bachelar above`/PopOver25Y)*100, # % of residents over 25yrs with bachelor degree and above
+         SNAP.p=(with_SNAP/`Tot.Housing units`)*100, # % of housing units receive food stamps
+         Hispanic.p =(Hispanic.Latino/Tot2022)*100, # %of Hispanics only
+         Black.p=(`Black alone`/Tot2022)*100, # %of blacks only
+         White.p =(`White alone.Not hispanic`/Tot2022)*100, # %of whites only not hispanics
+         Asian.p =(`Asiania  alone`/Tot2022)*100, # % of asian only
+         AIAN.p=(`American Indian and Alaska Native alone`/Tot2022)*100, # % of AI & AN only
+         Native.p =(`Native Hawaiian and Other Pacific Islander alone`/Tot2022)*100, # % of native H and pacific isalnder only
+         Poverty.level.p= (Income.below.poverty/Tot2022)*100, # % of families with income below poverty level
+         Unemployed.p = (Unemployed/PopOver16yr)*100, # % unemployed in labour force
+         Uninsured.p =(Tot.No.Insure/Tot2022)*100, # % of residents without insurance
+         VacantUnits.p =(`vacant units`/`Tot.Housing units`)*100, # %of vacant houshold units
+         Vacant_Occupied.unit.p =(`vacant units`/`Occupied units.or.HHs`)*100, # %of vacnt HH to occupied HH
+         Rented.p = (`renter occupied  Housing units`/`Tot.Housing units`)*100, # %of rented housing units
+         Pop.den = Tot2022/area_sq_mi, # pop/sq.mile
+         House.den = `Tot.Housing units`/area_sq_mi, # housing units/ sq mile
+         No.vehicle = (`HH no vehicle`/Tot.households)*100, # 5 HHs without vehicle
+         Male.p =(Totmale/Tot2022)*100, #% of males
+         Female.p = (Totfemale/Tot2022)*100, #%of female
+         P18_39 = (age18_39/Tot2022)*100, #% residents aged 18-39
+         p40_59= (age40_59/Tot2022)*100, #% residents aged 40-59
+         p.Above60 = (age.above60/Tot2022)*100, #%residents aged above 60
+)
+
+#save
+write.csv(Aim_1_dat_2, "Aim_1_dat_2.csv")
+```
+
+select variables of interest
+```{r}
+Aim_1_dat_3 <- Aim_1_dat_2%>%
+  select(2,3,13,14,39,40:46,52,54,59:62,64,66:93)
+
+
+sapply(Aim_1_dat_3, class)  # Displays the class (type) of each column
+
+Aim_1_dat_3$medianHH.Income <- as.numeric(Aim_1_dat_3$medianHH.Income)
+Aim_1_dat_3$Gini.Index.Income <- as.numeric(Aim_1_dat_3$Gini.Index.Income)
+Aim_1_dat_3$`Opioid_presciption,1k` <- as.numeric(Aim_1_dat_3$`Opioid_presciption,1k`)
+Aim_1_dat_3$HCVrate_RF <- as.numeric(Aim_1_dat_3$HCVrate_RF)
+
+
+```
+
+Correlation matrix
+```{r}
+# Function to calculate correlation with p-values
+cor_with_pvalues <- function(data) {
+  cor_test <- function(x, y) cor.test(x, y, method = "pearson")$p.value
+  p_matrix <- outer(names(data), names(data), Vectorize(function(i, j) cor_test(data[[i]], data[[j]])))
+  cor_matrix <- cor(data, use = "complete.obs", method = "pearson")
+  list(correlation = cor_matrix, p_values = p_matrix)
+}
+
+Only_numeric_V <- Aim_1_dat_3[sapply(Aim_1_dat_3, is.numeric)]%>%
+  filter(Cases_RF<1000)
+
+# Compute correlation matrix and p-values
+results <- cor_with_pvalues(Only_numeric_V[,-c(1,2,8,16:17,21:24)])
+print(results$correlation)  # Correlation matrix
+print(results$p_values)     # P-values
+
+library(corrplot)
+
+# Plot correlation matrix
+
+# Define colors for labels
+highlight_var <- "HCVrate_RF"  # Variable to highlight
+
+# Save as TIFF
+tiff("correlation_matrix.tiff", width = 2200, height = 1500, res = 300)  # 
+
+par(mar = c(8, 7, 7, 9))  # Increase right margin for space
+corrplot(results$correlation, method = "circle", type = "upper", tl.col = "black", tl.srt = 45, tl.cex = 0.5, diag = T,
+         insig = "label", sig.level = 0.05, order = "hclust", addrect = 2)
+# Add y-axis label
+mtext("Correlation Coefficients", side = 4, line = 3.5, cex = 1.2)
+# Close the graphics device
+dev.off()
+
+
+```
+
+create shape file using for the data:
+Used for mapping in ArcGIS pro
+```{r}
+library(sf)
+library(dplyr)
+
+LA_zip <- st_read("D:/LA county analysis/zipcodedata/Zip_Codes_(LA_County).shp") # ZIP CODES
+target_crs <- st_crs(LA_zip)
+LA_zip <- LA_zip%>%
+  select(-6)
+LA_zip$ZIP <- as.character(LA_zip$ZIP)
+# Remove the 'OBJECTID' column from the shapefile
+LA_zip <- LA_zip[, !colnames(LA_zip) %in% c("OBJECTID","ZIPCODE")]
+
+# Rename long field names to 10 characters or less
+Aim_1_dat_3_name <- Aim_1_dat_3
+colnames(Aim_1_dat_3_name) <- substr(colnames(Aim_1_dat_3_name), 1, 10)  # Truncate to 10 character
+
+#Aim_1_dat_3 shapefile
+Aim_1_dat_3_shp <- LA_zip%>%left_join(Aim_1_dat_3_name[,-14], by="ZIP")
+
+# save as shapefile
+st_write(Aim_1_dat_3_shp, "Aim_1_dat.shp", append = F, delete_layer = T)
+```
+
